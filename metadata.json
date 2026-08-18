@@ -1,0 +1,6 @@
+{
+  "name": "Conductor",
+  "description": "Live Improvised Music Conduction",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
