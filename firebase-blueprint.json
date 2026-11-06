@@ -1,0 +1,64 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and preferences",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Session": {
+      "title": "Session",
+      "description": "Recorded conduction session",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "sessionName": { "type": "string" },
+        "duration": { "type": "number" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Gesture": {
+      "title": "Gesture",
+      "description": "Custom gesture mapping",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "targetTrackId": { "type": "string" }
+      }
+    },
+    "Track": {
+      "title": "Track",
+      "description": "Audio track configuration",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "preset": { "type": "string" },
+        "volume": { "type": "number" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores user profiles"
+    },
+    "/sessions/{sessionId}": {
+      "schema": "Session",
+      "description": "Recorded conduction sessions"
+    },
+    "/gestures/{gestureId}": {
+      "schema": "Gesture",
+      "description": "Custom user gesture mappings"
+    },
+    "/tracks/{trackId}": {
+      "schema": "Track",
+      "description": "Configured user tracks"
+    }
+  }
+}
