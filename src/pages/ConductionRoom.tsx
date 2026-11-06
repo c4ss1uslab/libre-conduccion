@@ -7,7 +7,27 @@ import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase';
 import { collection, addDoc } from 'firebase/firestore';
 import { TrackData } from '../types';
-import { Play, Square, Mic, Radio, Hand, Plus, Activity, Camera, VideoOff, Cpu, CheckCircle2 } from 'lucide-react';
+import { AssignTrackModal } from '../components/AssignTrackModal';
+import { globalAudioEngine, PRESET_OPTIONS } from '../lib/audioEngine';
+import { 
+  Play, 
+  Square, 
+  Mic, 
+  Radio, 
+  Hand, 
+  Plus, 
+  Activity, 
+  Camera, 
+  VideoOff, 
+  Cpu, 
+  Volume2, 
+  VolumeX, 
+  Trash2, 
+  Music, 
+  Sparkles,
+  Sliders,
+  CheckCircle2
+} from 'lucide-react';
 import { cn } from '../lib/utils';
 
 interface FingersState {
@@ -33,6 +53,7 @@ export function ConductionRoom() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
   const lastVideoTimeRef = useRef(-1);
+  const lastDetectionTimestampRef = useRef<number>(0);
   const lastTriggerTimeRef = useRef<number>(0);
   
   const [isAudioReady, setIsAudioReady] = useState(false);
@@ -43,6 +64,10 @@ export function ConductionRoom() {
   const isCameraOnRef = useRef(true);
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [recordingTimeLeft, setRecordingTimeLeft] = useState<number>(10);
+  const [activeRecordingTrackId, setActiveRecordingTrackId] = useState<string | null>(null);
+
+  // Modal State
+  const [isAssignModalOpen, setIsAssignModalOpen] = useState(false);
 
   const [fingersState, setFingersState] = useState<FingersState>({
     thumb: false,
@@ -64,42 +89,78 @@ export function ConductionRoom() {
   const micStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const loopStartTimesRef = useRef<Record<string, number>>({});
+  const [loopProgress, setLoopProgress] = useState<Record<string, { secondsLeft: number; percent: number }>>({});
+  const recordingTimeoutRef = useRef<any>(null);
+  const recordingIntervalRef = useRef<any>(null);
+  const recordingStartTimeRef = useRef<number>(0);
+  const activeRecordingTrackIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     isCameraOnRef.current = isCameraOn;
   }, [isCameraOn]);
 
-  useEffect(() => {
-    if (navigator.permissions && navigator.permissions.query) {
-      navigator.permissions.query({ name: 'microphone' as PermissionName })
-        .then((permissionStatus) => {
-          setMicPermission(permissionStatus.state as 'granted' | 'denied' | 'prompt');
-          permissionStatus.onchange = () => {
-            setMicPermission(permissionStatus.state as 'granted' | 'denied' | 'prompt');
-          };
-        })
-        .catch((err) => console.log("Permissions API error:", err));
-    }
-  }, []);
-  
   const [tracks, setTracks] = useState<TrackData[]>([
-    { id: '1', name: 'Mic Loop 1', type: 'loop', status: 'idle', volume: -6 },
-    { id: '2', name: 'Pattern Synth', type: 'instrument', status: 'idle', volume: -12 },
-    { id: '3', name: 'Drum Sample', type: 'sample', status: 'idle', volume: 0 },
+    { id: '1', name: 'Mic Loop 1 (Main Voice)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_10s', assignedGesture: 'Open Palm', loopDuration: 10 },
+    { id: '2', name: 'Mic Loop 2 (Vocal Chops)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_5s', assignedGesture: 'Thumbs Up', loopDuration: 5 },
+    { id: '3', name: 'Mic Loop 3 (Beatbox/Rhythm)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_10s', assignedGesture: 'Rock On', loopDuration: 10 },
+    { id: '4', name: 'Mic Loop 4 (Harmonies)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_5s', assignedGesture: 'Call Me', loopDuration: 5 },
+    { id: '5', name: 'Mic Loop 5 (Acoustic FX)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_16s', assignedGesture: 'Three Fingers', loopDuration: 16 },
+    { id: '6', name: 'Mic Loop 6 (Percussion)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_10s', assignedGesture: 'Manual Only', loopDuration: 10 },
+    { id: '7', name: 'Mic Loop 7 (Atmosphere)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_5s', assignedGesture: 'Manual Only', loopDuration: 5 },
+    { id: '8', name: 'Mic Loop 8 (Bass Vocal)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_10s', assignedGesture: 'Manual Only', loopDuration: 10 },
+    { id: '9', name: 'Mic Loop 9 (Ad-libs)', type: 'loop', status: 'idle', volume: -6, preset: 'mic_loop_5s', assignedGesture: 'Manual Only', loopDuration: 5 },
+    { id: '10', name: 'PolySynth Chords', type: 'instrument', status: 'idle', volume: -8, preset: 'poly_synth', assignedGesture: 'Point Up' },
+    { id: '11', name: '808 Trap Groove', type: 'sample', status: 'idle', volume: -6, preset: 'beat_808', assignedGesture: 'Peace Sign' },
+    { id: '12', name: 'Cyberpunk FM Lead', type: 'instrument', status: 'idle', volume: -10, preset: 'fm_lead', assignedGesture: 'Manual Only' },
   ]);
+  const tracksRef = useRef<TrackData[]>(tracks);
+  useEffect(() => {
+    tracksRef.current = tracks;
+  }, [tracks]);
+
+  // Smooth live duration progress for looping tracks
+  useEffect(() => {
+    let animId: number;
+    const updateLoopTimers = () => {
+      const playingLoops = tracks.filter(t => t.type === 'loop' && t.status === 'playing');
+      if (playingLoops.length > 0) {
+        const now = performance.now();
+        const progressMap: Record<string, { secondsLeft: number; percent: number }> = {};
+
+        playingLoops.forEach(track => {
+          if (!loopStartTimesRef.current[track.id]) {
+            loopStartTimesRef.current[track.id] = now;
+          }
+          const startTime = loopStartTimesRef.current[track.id];
+          const duration = track.loopDuration || 10;
+          const elapsedSec = (now - startTime) / 1000;
+          const currentCycleSec = elapsedSec % duration;
+          const secondsLeft = Math.max(0, duration - currentCycleSec);
+          const percent = Math.min(100, Math.max(0, (currentCycleSec / duration) * 100));
+
+          progressMap[track.id] = { secondsLeft, percent };
+        });
+        setLoopProgress(progressMap);
+      } else {
+        setLoopProgress({});
+      }
+      animId = requestAnimationFrame(updateLoopTimers);
+    };
+
+    animId = requestAnimationFrame(updateLoopTimers);
+    return () => cancelAnimationFrame(animId);
+  }, [tracks]);
 
   const [activeGesture, setActiveGesture] = useState<string | null>(null);
   const [sessionStartTime] = useState(Date.now());
   const [stats, setStats] = useState({ gestures: 0, loops: 0 });
 
-  // Tone.js refs
-  const synths = useRef<Record<string, Tone.PolySynth | Tone.Synth>>({});
-  const loops = useRef<Record<string, Tone.Player>>({});
-
   useEffect(() => {
     isAudioReadyRef.current = isAudioReady;
   }, [isAudioReady]);
 
+  // Initialize MediaPipe Vision HandLandmarker
   useEffect(() => {
     let isMounted = true;
     async function initMediaPipe() {
@@ -120,6 +181,8 @@ export function ConductionRoom() {
         });
         if (isMounted) {
           handLandmarkerRef.current = landmarker;
+          lastDetectionTimestampRef.current = Math.max(lastDetectionTimestampRef.current, Math.round(performance.now()));
+          lastVideoTimeRef.current = -1;
           setIsModelLoading(false);
           setModelError(null);
         }
@@ -139,15 +202,19 @@ export function ConductionRoom() {
     };
   }, []);
 
-  // Initialize Synths
+  // Initialize Audio tracks & audio engine
   useEffect(() => {
-    synths.current['2'] = new Tone.PolySynth(Tone.Synth).toDestination();
-    synths.current['2'].volume.value = -12;
-    
+    tracks.forEach(track => {
+      globalAudioEngine.registerTrack(track);
+    });
+
     return () => {
-      // Cleanup
-      Object.values(synths.current).forEach(s => (s as any).dispose());
-      Object.values(loops.current).forEach(l => (l as any).dispose());
+      if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+      if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        try { mediaRecorderRef.current.stop(); } catch (e) {}
+      }
+      globalAudioEngine.cleanup();
       if (micStreamRef.current) {
         micStreamRef.current.getTracks().forEach(track => track.stop());
       }
@@ -167,8 +234,8 @@ export function ConductionRoom() {
 
   const initAudio = async () => {
     try {
-      await Tone.start();
-      console.log("Tone.js audio context started");
+      await globalAudioEngine.initialize();
+      console.log("Audio Engine context initialized");
       
       // Request microphone permission to capture real mic loop audio
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -179,110 +246,257 @@ export function ConductionRoom() {
     } catch (err) {
       console.error("Error accessing microphone or starting audio engine:", err);
       setMicPermission('denied');
-      setIsAudioReady(true); // Proceed with engine start anyway so they can play synths
+      setIsAudioReady(true); // Proceed with audio synth playback
     }
   };
 
-  const simulateGesture = useCallback((gestureName: string, action: string, targetId: string) => {
-    if (!isAudioReadyRef.current) return;
+  const handleAssignTrack = (newTrack: TrackData) => {
+    // Register audio engine node
+    globalAudioEngine.registerTrack(newTrack);
+    setTracks(prev => [...prev, newTrack]);
+  };
+
+  const handleDeleteTrack = (trackId: string) => {
+    globalAudioEngine.disposeTrack(trackId);
+    delete loopStartTimesRef.current[trackId];
+    setTracks(prev => prev.filter(t => t.id !== trackId));
+  };
+
+  const handleVolumeChange = (trackId: string, volume: number) => {
+    setTracks(prev => prev.map(t => {
+      if (t.id === trackId) {
+        globalAudioEngine.setVolume(trackId, volume, t.muted);
+        return { ...t, volume };
+      }
+      return t;
+    }));
+  };
+
+  const handleToggleMute = (trackId: string) => {
+    setTracks(prev => prev.map(t => {
+      if (t.id === trackId) {
+        const nextMuted = !t.muted;
+        globalAudioEngine.setVolume(trackId, t.volume, nextMuted);
+        return { ...t, muted: nextMuted };
+      }
+      return t;
+    }));
+  };
+
+  const finishRecording = useCallback((trackId: string) => {
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    if (recordingIntervalRef.current) {
+      clearInterval(recordingIntervalRef.current);
+      recordingIntervalRef.current = null;
+    }
+
+    const startTime = recordingStartTimeRef.current || performance.now();
+    const elapsedSec = Math.max(0.4, (performance.now() - startTime) / 1000);
+    const currentTrack = tracksRef.current.find(t => t.id === trackId);
+    const maxDuration = currentTrack?.loopDuration || 10;
+    const actualDuration = Math.min(maxDuration, Math.round(elapsedSec * 10) / 10);
+
+    // Update track duration to actual duration and status to playing
+    setTracks(currentTracks => currentTracks.map(t => {
+      if (t.id === trackId) {
+        return { 
+          ...t, 
+          status: 'playing', 
+          loopDuration: actualDuration 
+        };
+      }
+      return t;
+    }));
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state === 'recording') {
+      try {
+        recorder.stop();
+      } catch (e) {
+        console.warn("Error stopping recorder:", e);
+      }
+    } else {
+      // Fallback: start loop player with synthesized audio buffer of exact recorded duration
+      globalAudioEngine.createFallbackLoop(trackId, actualDuration, currentTrack?.volume ?? -6);
+    }
+
+    loopStartTimesRef.current[trackId] = performance.now();
+    setActiveRecordingTrackId(null);
+    activeRecordingTrackIdRef.current = null;
+    setRecordingTimeLeft(0);
+  }, []);
+
+  const recordMicLoop = useCallback((trackId: string, durationSec: number = 10) => {
+    // If another track was recording, finish it early and save it
+    if (activeRecordingTrackIdRef.current && activeRecordingTrackIdRef.current !== trackId) {
+      finishRecording(activeRecordingTrackIdRef.current);
+    }
+
+    setStats(s => ({ ...s, loops: s.loops + 1 }));
+    setActiveRecordingTrackId(trackId);
+    activeRecordingTrackIdRef.current = trackId;
+    setRecordingTimeLeft(durationSec);
+    recordingStartTimeRef.current = performance.now();
+    delete loopStartTimesRef.current[trackId];
+
+    // Set track status to recording
+    setTracks(currentTracks => currentTracks.map(t => t.id === trackId ? { ...t, status: 'recording' } : t));
+
+    // Gesture cooldown to prevent rapid same-frame re-trigger
+    lastTriggerTimeRef.current = Date.now();
+
+    if (recordingTimeoutRef.current) clearTimeout(recordingTimeoutRef.current);
+    if (recordingIntervalRef.current) clearInterval(recordingIntervalRef.current);
+
+    // Countdown interval
+    recordingIntervalRef.current = setInterval(() => {
+      setRecordingTimeLeft(prev => {
+        if (prev <= 0.1) {
+          if (recordingIntervalRef.current) {
+            clearInterval(recordingIntervalRef.current);
+            recordingIntervalRef.current = null;
+          }
+          return 0;
+        }
+        return prev - 0.1;
+      });
+    }, 100);
+
+    let recorder: MediaRecorder | null = null;
+    if (micStreamRef.current) {
+      try {
+        audioChunksRef.current = [];
+        recorder = new MediaRecorder(micStreamRef.current);
+        mediaRecorderRef.current = recorder;
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            audioChunksRef.current.push(e.data);
+          }
+        };
+        recorder.onstop = () => {
+          if (audioChunksRef.current.length > 0) {
+            const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+            const audioUrl = URL.createObjectURL(blob);
+            const currentTrack = tracksRef.current.find(t => t.id === trackId);
+            globalAudioEngine.setLoopPlayer(trackId, audioUrl, currentTrack?.volume ?? -6);
+          } else {
+            const currentTrack = tracksRef.current.find(t => t.id === trackId);
+            globalAudioEngine.createFallbackLoop(trackId, currentTrack?.loopDuration || durationSec, currentTrack?.volume ?? -6);
+          }
+        };
+        recorder.start();
+      } catch (err) {
+        console.error("Failed to start MediaRecorder:", err);
+      }
+    }
+
+    // Schedule maximum duration finish
+    recordingTimeoutRef.current = setTimeout(() => {
+      finishRecording(trackId);
+    }, durationSec * 1000);
+  }, [finishRecording]);
+
+  const simulateGesture = useCallback((gestureName: string, actionOverride?: string, targetIdOverride?: string) => {
+    if (!isAudioReadyRef.current) {
+      initAudio();
+    }
     setActiveGesture(gestureName);
     setStats(s => ({ ...s, gestures: s.gestures + 1 }));
-    
-    // Execute action
-    if (action === 'play_instrument') {
-      const synth = synths.current[targetId];
-      if (synth) {
-        setTracks(ts => ts.map(t => t.id === targetId ? { ...t, status: 'playing' } : t));
-        synth.triggerAttackRelease(["C4", "E4", "G4"], "4n");
-        setTimeout(() => {
-          setTracks(ts => ts.map(t => t.id === targetId ? { ...t, status: 'idle' } : t));
-        }, 500);
+
+    // Stop single track
+    if (actionOverride === 'stop_single' && targetIdOverride) {
+      if (activeRecordingTrackIdRef.current === targetIdOverride) {
+        // If user explicitly stops a currently recording track via stop button, finish early and play
+        finishRecording(targetIdOverride);
+      } else {
+        globalAudioEngine.stopTrack(targetIdOverride);
+        delete loopStartTimesRef.current[targetIdOverride];
+        setTracks(ts => ts.map(t => t.id === targetIdOverride ? { ...t, status: 'idle' } : t));
       }
-    } else if (action === 'record_loop') {
-      // Check if already recording
-      setTracks(ts => {
-        const isAlreadyRec = ts.some(t => t.id === targetId && t.status === 'recording');
-        if (isAlreadyRec) return ts;
+      return;
+    }
 
-        // Trigger loop record
-        setStats(s => ({ ...s, loops: s.loops + 1 }));
-        setRecordingTimeLeft(10.0);
+    // Fist always stops all tracks
+    if (gestureName === 'Fist' || actionOverride === 'stop_all') {
+      if (recordingTimeoutRef.current) {
+        clearTimeout(recordingTimeoutRef.current);
+        recordingTimeoutRef.current = null;
+      }
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        try { mediaRecorderRef.current.stop(); } catch (e) {}
+      }
+      globalAudioEngine.stopAll();
+      loopStartTimesRef.current = {};
+      setTracks(ts => ts.map(t => ({ ...t, status: 'idle' })));
+      setActiveRecordingTrackId(null);
+      activeRecordingTrackIdRef.current = null;
+      setTimeout(() => setActiveGesture(null), 1000);
+      return;
+    }
 
-        // Standard countdown timer
-        const timerInterval = setInterval(() => {
-          setRecordingTimeLeft(prev => {
-            if (prev <= 0.1) {
-              clearInterval(timerInterval);
-              return 0;
-            }
-            return prev - 0.1;
-          });
-        }, 100);
+    // Find track explicitly bound to this gesture, or use targetIdOverride
+    const currentTracks = tracksRef.current;
+    let targetTrack: TrackData | undefined;
+    
+    if (targetIdOverride) {
+      targetTrack = currentTracks.find(t => t.id === targetIdOverride);
+    } else {
+      targetTrack = currentTracks.find(t => t.assignedGesture === gestureName);
+    }
 
-        // Try actual recording if we have mic stream
-        let recorder: MediaRecorder | null = null;
-        if (micStreamRef.current) {
-          try {
-            audioChunksRef.current = [];
-            recorder = new MediaRecorder(micStreamRef.current);
-            mediaRecorderRef.current = recorder;
-            recorder.ondataavailable = (e) => {
-              if (e.data.size > 0) {
-                audioChunksRef.current.push(e.data);
-              }
-            };
-            recorder.onstop = () => {
-              const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-              const audioUrl = URL.createObjectURL(blob);
-              
-              if (loops.current['1']) {
-                loops.current['1'].dispose();
-              }
-              const player = new Tone.Player({
-                url: audioUrl,
-                loop: true,
-                autostart: true,
-              }).toDestination();
-              player.volume.value = -6;
-              loops.current['1'] = player;
-            };
-            recorder.start();
-          } catch (err) {
-            console.error("Failed to start MediaRecorder:", err);
+    // Fallback default routing if not found
+    if (!targetTrack) {
+      if (gestureName === 'Open Palm') targetTrack = currentTracks.find(t => t.type === 'loop');
+      else if (gestureName === 'Point Up') targetTrack = currentTracks.find(t => t.type === 'instrument');
+      else if (gestureName === 'Peace Sign') targetTrack = currentTracks.find(t => t.type === 'sample');
+    }
+
+    if (targetTrack) {
+      if (targetTrack.type === 'instrument') {
+        setTracks(ts => ts.map(t => t.id === targetTrack!.id ? { ...t, status: 'playing' } : t));
+        globalAudioEngine.playInstrumentTrack(targetTrack);
+        setTimeout(() => {
+          setTracks(ts => ts.map(t => t.id === targetTrack!.id ? { ...t, status: 'idle' } : t));
+        }, 600);
+      } else if (targetTrack.type === 'sample') {
+        setTracks(ts => ts.map(t => t.id === targetTrack!.id ? { ...t, status: 'playing' } : t));
+        globalAudioEngine.playSampleTrack(targetTrack);
+        setTimeout(() => {
+          setTracks(ts => ts.map(t => t.id === targetTrack!.id ? { ...t, status: 'idle' } : t));
+        }, 600);
+      } else if (targetTrack.type === 'loop') {
+        const isRec = targetTrack.status === 'recording' || activeRecordingTrackIdRef.current === targetTrack.id;
+
+        if (actionOverride === 'play' || actionOverride === 'play_loop') {
+          if (isRec) {
+            // Clicking play or triggering play while recording finishes early and starts loop
+            finishRecording(targetTrack.id);
+          } else {
+            globalAudioEngine.playLoopTrack(targetTrack.id, targetTrack.loopDuration || 10, targetTrack.volume ?? -6);
+            loopStartTimesRef.current[targetTrack.id] = performance.now();
+            setTracks(ts => ts.map(t => t.id === targetTrack!.id ? { ...t, status: 'playing' } : t));
+          }
+        } else {
+          // Record action or assigned gesture trigger
+          if (isRec) {
+            // Showing assigned gesture or clicking record while recording ends it early and saves/plays it!
+            finishRecording(targetTrack.id);
+          } else {
+            recordMicLoop(targetTrack.id, targetTrack.loopDuration || 10);
           }
         }
-
-        // Handle 10-second completion
-        setTimeout(() => {
-          if (recorder && recorder.state === 'recording') {
-            recorder.stop();
-            setTracks(currentTracks => currentTracks.map(t => t.id === targetId ? { ...t, status: 'playing' } : t));
-          } else {
-            // No microphone stream available or active, revert back to idle safely
-            setTracks(currentTracks => currentTracks.map(t => t.id === targetId ? { ...t, status: 'idle' } : t));
-          }
-        }, 10000);
-
-        return ts.map(t => t.id === targetId ? { ...t, status: 'recording' } : t);
-      });
-    } else if (action === 'stop_all') {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
       }
-      if (loops.current['1']) {
-        loops.current['1'].stop();
-      }
-      if (synths.current['1_sim']) {
-        try {
-          synths.current['1_sim'].dispose();
-        } catch (e) {}
-        delete synths.current['1_sim'];
-      }
-      setTracks(ts => ts.map(t => ({ ...t, status: 'idle' })));
     }
 
     setTimeout(() => setActiveGesture(null), 1000);
-  }, []);
+  }, [initAudio, recordMicLoop, finishRecording]);
 
   const predictWebcam = useCallback(() => {
     if (!isCameraOnRef.current) {
@@ -311,12 +525,23 @@ export function ConductionRoom() {
       if (ctx) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         
-        const startTimeMs = performance.now();
         if (lastVideoTimeRef.current !== video.currentTime) {
           lastVideoTimeRef.current = video.currentTime;
-          const results = landmarker.detectForVideo(video, startTimeMs);
           
-          if (results.landmarks && results.landmarks.length > 0) {
+          const currentPerfNow = Math.round(performance.now());
+          const startTimeMs = Math.max(currentPerfNow, (lastDetectionTimestampRef.current || 0) + 1);
+          lastDetectionTimestampRef.current = startTimeMs;
+
+          let results: any = null;
+          try {
+            results = landmarker.detectForVideo(video, startTimeMs);
+          } catch (detectionErr) {
+            // If a timestamp collision or frame skip occurred in MediaPipe WASM, advance the timestamp safely
+            lastDetectionTimestampRef.current += 35;
+            return;
+          }
+          
+          if (results && results.landmarks && results.landmarks.length > 0) {
             // Draw landmarks
             for (const landmarks of results.landmarks) {
               for (let i = 0; i < landmarks.length; i++) {
@@ -328,16 +553,16 @@ export function ConductionRoom() {
                 ctx.fill();
               }
               
-              // Draw connections (simple wireframe)
-              ctx.strokeStyle = '#6366f1'; // indigo-500
+              // Draw connections wireframe
+              ctx.strokeStyle = '#6366f1';
               ctx.lineWidth = 2;
               const connections = [
-                [0, 1, 2, 3, 4], // thumb
-                [0, 5, 6, 7, 8], // index
-                [9, 10, 11, 12], // middle
-                [13, 14, 15, 16], // ring
-                [17, 18, 19, 20], // pinky
-                [5, 9, 13, 17, 0] // palm
+                [0, 1, 2, 3, 4],
+                [0, 5, 6, 7, 8],
+                [9, 10, 11, 12],
+                [13, 14, 15, 16],
+                [17, 18, 19, 20],
+                [5, 9, 13, 17, 0]
               ];
               
               for (const connection of connections) {
@@ -356,7 +581,6 @@ export function ConductionRoom() {
             // High Precision rotation-invariant Gesture Detection
             const landmarks = results.landmarks[0];
             
-            // A finger is extended if tip is far from both MCP joint and Wrist
             const isFingerExtended = (tipIdx: number, pipIdx: number, mcpIdx: number) => {
               const dTipMcp = getDistance(landmarks[tipIdx], landmarks[mcpIdx]);
               const dPipMcp = getDistance(landmarks[pipIdx], landmarks[mcpIdx]);
@@ -370,7 +594,6 @@ export function ConductionRoom() {
             const ringUp = isFingerExtended(16, 14, 13);
             const pinkyUp = isFingerExtended(20, 18, 17);
 
-            // Thumb is extended if it is reasonably straight and stands outward away from the palm/index finger
             const dTipMcp = getDistance(landmarks[4], landmarks[2]);
             const dTipIp = getDistance(landmarks[4], landmarks[3]);
             const dIpMcp = getDistance(landmarks[3], landmarks[2]);
@@ -385,10 +608,8 @@ export function ConductionRoom() {
             const dMcpPinkyMcp = getDistance(landmarks[2], landmarks[17]);
             const thumbAwayFromPinkyRatio = dTipPinkyMcp / dMcpPinkyMcp;
 
-            // Robust check: straight thumb, and tip is further away from the palm base & index finger than the thumb's base joint is
             const thumbUp = isThumbStraight && (thumbOutwardRatio > 1.15) && (thumbAwayFromPinkyRatio > 1.02);
 
-            // Stable fingersState React updates
             const currentFingers = { thumb: thumbUp, index: indexUp, middle: middleUp, ring: ringUp, pinky: pinkyUp };
             if (
               currentFingers.thumb !== lastFingersStateRef.current.thumb ||
@@ -401,10 +622,20 @@ export function ConductionRoom() {
               setFingersState(currentFingers);
             }
 
-            // Determine current raw gesture candidate
-            let gesture = null;
+            // Determine current gesture candidate
+            let gesture: string | null = null;
             if (indexUp && middleUp && ringUp && pinkyUp) {
               gesture = 'Open Palm';
+            } else if (indexUp && middleUp && !ringUp && !pinkyUp) {
+              gesture = 'Peace Sign';
+            } else if (indexUp && !middleUp && !ringUp && pinkyUp) {
+              gesture = 'Rock On';
+            } else if (thumbUp && !indexUp && !middleUp && !ringUp && !pinkyUp) {
+              gesture = 'Thumbs Up';
+            } else if (thumbUp && !indexUp && !middleUp && !ringUp && pinkyUp) {
+              gesture = 'Call Me';
+            } else if (indexUp && middleUp && ringUp && !pinkyUp) {
+              gesture = 'Three Fingers';
             } else if (indexUp && !middleUp && !ringUp && !pinkyUp) {
               gesture = 'Point Up';
             } else if (!indexUp && !middleUp && !ringUp && !pinkyUp) {
@@ -419,18 +650,12 @@ export function ConductionRoom() {
                 gestureConsecutiveFramesRef.current = 1;
               }
 
-              // Fire ONLY if the gesture is consistently held for at least 5 consecutive frames (~150-200ms)
-              if (gestureConsecutiveFramesRef.current >= 5) {
+              // Fire if held consistently for 4 consecutive frames
+              if (gestureConsecutiveFramesRef.current >= 4) {
                 const now = Date.now();
-                if (now - lastTriggerTimeRef.current > 1000) {
+                if (now - lastTriggerTimeRef.current > 900) {
                   lastTriggerTimeRef.current = now;
-                  if (gesture === 'Open Palm') {
-                    simulateGesture(gesture, 'record_loop', '1');
-                  } else if (gesture === 'Point Up') {
-                    simulateGesture(gesture, 'play_instrument', '2');
-                  } else if (gesture === 'Fist') {
-                    simulateGesture(gesture, 'stop_all', '');
-                  }
+                  simulateGesture(gesture);
                 }
               }
             } else {
@@ -438,7 +663,6 @@ export function ConductionRoom() {
               gestureConsecutiveFramesRef.current = 0;
             }
           } else {
-            // No hands in frame, reset finger state
             const noFingers = { thumb: false, index: false, middle: false, ring: false, pinky: false };
             if (
               noFingers.thumb !== lastFingersStateRef.current.thumb ||
@@ -458,7 +682,6 @@ export function ConductionRoom() {
     }
   }, [simulateGesture]);
 
-  // Stable animation frame loop hook
   const predictRef = useRef<() => void>(undefined);
   useEffect(() => {
     predictRef.current = predictWebcam;
@@ -478,101 +701,21 @@ export function ConductionRoom() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full space-y-4">
-      {/* Dynamic Status Dashboard */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-zinc-950 border border-zinc-800 rounded-xl p-4">
-        {/* Camera Controller & Status */}
-        <div className="flex items-center justify-between border-b md:border-b-0 md:border-r border-zinc-800 pb-4 md:pb-0 md:pr-4">
-          <div className="flex items-center gap-3">
-            <div className={cn(
-              "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-              isCameraOn ? "bg-emerald-500/10 text-emerald-400" : "bg-rose-500/10 text-rose-400"
-            )}>
-              {isCameraOn ? <Camera className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
-            </div>
-            <div>
-              <div className="text-xs font-bold uppercase tracking-wider text-zinc-400">Conduction Camera</div>
-              <div className="text-[10px] font-mono text-zinc-500 uppercase">
-                {isCameraOn ? "Camera: Active" : "Camera: Off / Disabled"}
-              </div>
-            </div>
-          </div>
-          <button
-            onClick={() => setIsCameraOn(!isCameraOn)}
-            className={cn(
-              "px-3 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all cursor-pointer",
-              isCameraOn 
-                ? "bg-zinc-900 hover:bg-rose-950/30 text-rose-400 border-rose-500/20 hover:border-rose-500/40" 
-                : "bg-indigo-600 hover:bg-indigo-700 text-white border-transparent"
-            )}
-            id="toggle-camera-btn"
-          >
-            {isCameraOn ? "Turn Off" : "Turn On"}
-          </button>
-        </div>
+    <div className="flex flex-col h-full space-y-3">
+      {/* Assign Track Modal */}
+      <AssignTrackModal
+        isOpen={isAssignModalOpen}
+        onClose={() => setIsAssignModalOpen(false)}
+        onAssignTrack={handleAssignTrack}
+        existingTracksCount={tracks.length}
+      />
 
-        {/* MediaPipe Model Status */}
-        <div className="flex items-center gap-3 border-b md:border-b-0 md:border-r border-zinc-800 pb-4 md:pb-0 md:px-4">
-          <div className={cn(
-            "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-            modelError ? "bg-rose-500/10 text-rose-400" : isModelLoading ? "bg-amber-500/10 text-amber-400 animate-pulse" : "bg-emerald-500/10 text-emerald-400"
-          )}>
-            <Cpu className="w-4 h-4" />
-          </div>
-          <div>
-            <div className="text-xs font-bold uppercase tracking-wider text-zinc-400">Hand Detection Engine</div>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              <span className={cn(
-                "w-2 h-2 rounded-full shrink-0",
-                modelError ? "bg-rose-500 shadow-[0_0_8px_#ef4444]" : isModelLoading ? "bg-amber-400 animate-ping" : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
-              )}></span>
-              <span className={cn(
-                "text-xs font-bold font-mono tracking-widest uppercase",
-                modelError ? "text-rose-400" : isModelLoading ? "text-amber-400" : "text-emerald-400"
-              )}>
-                {modelError ? "TRACKING: SIMULATED" : isModelLoading ? "LOADING MODEL..." : "TRACKING: ACTIVE"}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        {/* Microphone Audio Status */}
-        <div className="flex items-center justify-between pl-0 md:pl-4">
-          <div className="flex items-center gap-3">
-            <div className={cn(
-              "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-              !isAudioReady ? "bg-rose-500/10 text-rose-400" :
-              micPermission === 'granted' ? "bg-emerald-500/10 text-emerald-400" : "bg-amber-500/10 text-amber-400"
-            )}>
-              <Mic className="w-4 h-4" />
-            </div>
-            <div>
-              <div className="text-xs font-bold uppercase tracking-wider text-zinc-400">Audio & Mic Routing</div>
-              <div className="text-[10px] font-mono text-zinc-500 uppercase">
-                {!isAudioReady ? "AUDIO ENGINE: READY" :
-                 micPermission === 'granted' ? "MIC: CAPTURING LIVE" :
-                 micPermission === 'denied' ? "MIC: ACCESS DENIED" : "MIC: ACCESS REQUESTED"}
-              </div>
-            </div>
-          </div>
-          {!isAudioReady && (
-            <button
-              onClick={initAudio}
-              className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer"
-              id="start-audio-btn"
-            >
-              Start Engine
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Header & Video Area */}
-      <div className="flex flex-col lg:flex-row gap-4 h-[50vh]">
+      {/* Top Section: Spacious Camera View (Left, col-span-8) & Vertical Conductor Sidebar (Right, col-span-4) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
         
-        {/* Main Tracking Video */}
-        <div className="flex-1 bg-zinc-900 rounded-2xl overflow-hidden relative border border-zinc-800 shadow-2xl shadow-indigo-900/10 flex items-center justify-center">
-          <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent z-10 pointer-events-none"></div>
+        {/* Spacious Camera View */}
+        <div className="lg:col-span-8 bg-zinc-900 rounded-2xl overflow-hidden relative border border-zinc-800 shadow-2xl flex items-center justify-center aspect-video min-h-[300px] max-h-[460px] w-full">
+          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/40 z-10 pointer-events-none" />
           
           {isCameraOn ? (
             <WebcamComponent 
@@ -586,11 +729,11 @@ export function ConductionRoom() {
             />
           ) : (
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950 text-zinc-500 z-0">
-              <VideoOff className="w-12 h-12 text-zinc-700 mb-2 animate-pulse" />
+              <VideoOff className="w-10 h-10 text-zinc-700 mb-2 animate-pulse" />
               <p className="text-xs uppercase tracking-wider font-mono">Camera Feed Offline</p>
               <button 
                 onClick={() => setIsCameraOn(true)}
-                className="mt-4 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded text-xs uppercase tracking-wider transition-all"
+                className="mt-3 px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded text-xs uppercase tracking-wider transition-all cursor-pointer shadow-lg shadow-indigo-600/30"
               >
                 Turn Camera On
               </button>
@@ -604,254 +747,453 @@ export function ConductionRoom() {
           
           {/* Tracking Overlay UI */}
           <div className="absolute inset-0 z-20 pointer-events-none p-4 flex flex-col justify-between">
-            <div className="flex gap-2">
-              <span className="px-2 py-1 bg-black/60 rounded text-[10px] font-mono border border-zinc-700 text-white">CAM_01: WIDE_ANGLE</span>
-              <span className="px-2 py-1 bg-indigo-600/80 rounded text-[10px] font-mono border border-white/20 text-white">
-                {isModelLoading ? 'LOADING MODEL...' : 'TRACKING: ACTIVE'}
+            {/* Overlay Header: Badges & Vanishing Toggle Icons */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="px-2.5 py-1 bg-black/60 rounded text-[10px] font-mono border border-zinc-700 text-zinc-300">
+                CAM_01: WIDE_ANGLE
               </span>
+              
+              <span className={cn(
+                "px-2.5 py-1 rounded text-[10px] font-mono border flex items-center gap-1.5",
+                modelError 
+                  ? "bg-rose-950/80 text-rose-300 border-rose-700/50" 
+                  : isModelLoading 
+                  ? "bg-amber-950/80 text-amber-300 border-amber-700/50 animate-pulse" 
+                  : "bg-emerald-950/80 text-emerald-300 border-emerald-700/50"
+              )}>
+                <span className={cn(
+                  "w-2 h-2 rounded-full shrink-0",
+                  modelError ? "bg-rose-400" : isModelLoading ? "bg-amber-400" : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
+                )} />
+                {modelError ? "TRACKING: ERROR" : isModelLoading ? "LOADING MODEL..." : "TRACKING: ACTIVE"}
+              </span>
+
+              {/* Small Camera Turn On button beside tracking status - vanishes once camera is turned on */}
+              {!isCameraOn && (
+                <button
+                  onClick={() => setIsCameraOn(true)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-mono font-bold uppercase tracking-wider border border-indigo-400/50 transition-all pointer-events-auto cursor-pointer shadow-lg shadow-indigo-600/40 animate-pulse"
+                  title="Click to turn on Camera"
+                  id="overlay-turn-on-camera-btn"
+                >
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>Turn On Cam</span>
+                </button>
+              )}
+
+              {/* Small Audio/Mic Turn On button beside tracking status - vanishes once audio is ready */}
+              {!isAudioReady && (
+                <button
+                  onClick={initAudio}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[10px] font-mono font-bold uppercase tracking-wider border border-rose-400/50 transition-all pointer-events-auto cursor-pointer shadow-lg shadow-rose-600/40 animate-pulse"
+                  title="Click to turn on Audio & Mic"
+                  id="overlay-turn-on-audio-btn"
+                >
+                  <Mic className="w-3.5 h-3.5" />
+                  <span>Turn On Audio/Mic</span>
+                </button>
+              )}
+
+              {/* Subtle Camera Off toggle when camera is on */}
+              {isCameraOn && (
+                <button
+                  onClick={() => setIsCameraOn(false)}
+                  className="p-1.5 bg-black/50 hover:bg-zinc-800 text-zinc-400 hover:text-rose-400 rounded-lg border border-zinc-700/60 transition-colors pointer-events-auto cursor-pointer ml-auto"
+                  title="Turn Camera Off"
+                  id="overlay-turn-off-camera-btn"
+                >
+                  <VideoOff className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
 
-            {/* Simulated Tracking Bounding Box */}
-            <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-[400px] h-[300px] border-2 border-indigo-500/20 rounded-full flex items-center justify-center">
-              <div className="absolute w-64 h-64 border border-indigo-400/30 rounded-lg"></div>
-              <div className="absolute top-1/4 left-1/4 w-3 h-3 bg-cyan-400 rounded-full shadow-[0_0_10px_rgba(34,211,238,0.8)]"></div>
-              <div className="absolute top-1/3 right-1/4 w-3 h-3 bg-cyan-400 rounded-full shadow-[0_0_10px_rgba(34,211,238,0.8)]"></div>
-            </div>
-
-            {/* Active Gesture Feedback */}
-            <div className="flex justify-center text-center pb-4">
+            {/* Active Gesture Detection Feedback in Center */}
+            <div className="flex justify-center text-center pb-3">
               {activeGesture ? (
-                <div className="animate-in fade-in slide-in-from-bottom-2">
-                  <div className="text-xs uppercase tracking-[0.3em] text-zinc-400 mb-2">Detected Command</div>
-                  <div className="text-4xl md:text-5xl font-black italic tracking-tighter text-white drop-shadow-[0_0_25px_rgba(255,255,255,0.4)]">{activeGesture}</div>
-                  <div className="mt-2 inline-flex items-center gap-2 px-3 py-1 bg-white/10 rounded-full border border-white/20">
-                    <span className="w-2 h-2 bg-emerald-400 rounded-full"></span>
-                    <span className="text-[10px] font-bold tracking-widest text-white">GESTURE: {activeGesture.toUpperCase().replace(/\s+/g, '_')}</span>
+                <div className="animate-in fade-in slide-in-from-bottom-2 bg-black/70 backdrop-blur-md px-5 py-2 rounded-2xl border border-indigo-500/40 shadow-xl shadow-indigo-500/20">
+                  <div className="text-[10px] uppercase tracking-[0.25em] text-zinc-400 mb-0.5">Command Detected</div>
+                  <div className="text-2xl md:text-3xl font-black italic tracking-tight text-white drop-shadow-[0_0_20px_rgba(255,255,255,0.4)]">
+                    {activeGesture}
                   </div>
                 </div>
               ) : (
-                <div className="h-24" /> // Placeholder
+                <div className="h-12" />
               )}
             </div>
           </div>
         </div>
 
-        {/* Action Panel / Dashboard (Right Side) */}
-        <div className="w-full lg:w-80 flex flex-col gap-4">
-          {!isAudioReady && (
-            <button 
-              onClick={initAudio}
-              className="w-full py-3 bg-rose-600/20 text-rose-400 border border-rose-600/30 rounded-xl text-xs font-bold uppercase tracking-wider transition-colors hover:bg-rose-600/30"
-            >
-              Start Audio Engine
-            </button>
-          )}
-
-          <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-4 flex-1 flex flex-col justify-between">
-            <div>
-              <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-500 mb-4 flex items-center gap-2">
-                 Session Metrics
-              </h3>
-              <div className="grid grid-cols-2 gap-3">
-                <div className="bg-indigo-500/5 border border-indigo-500/10 rounded-lg p-2.5 flex flex-col items-center justify-center">
-                  <span className="text-[9px] text-indigo-400 uppercase tracking-wider font-mono">Gestures</span>
-                  <span className="text-lg font-mono font-bold text-white mt-0.5">{stats.gestures}</span>
+        {/* Right: Vertical Conductor Overview Sidebar (col-span-4) */}
+        <div className="lg:col-span-4 bg-zinc-950 border border-zinc-800 rounded-2xl p-4 flex flex-col justify-between shadow-xl">
+          <div className="space-y-3.5">
+            {/* Compact Session Metrics Row */}
+            <div className="flex items-center justify-between gap-2 pb-3 border-b border-zinc-800/80">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400">Metrics:</span>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 font-mono text-[11px] font-bold">
+                  <span className="text-zinc-500 font-normal">Gestures:</span> {stats.gestures}
                 </div>
-                <div className="bg-rose-500/5 border border-rose-500/10 rounded-lg p-2.5 flex flex-col items-center justify-center">
-                  <span className="text-[9px] text-rose-400 uppercase tracking-wider font-mono">Loops Recorded</span>
-                  <span className="text-lg font-mono font-bold text-white mt-0.5">{stats.loops}</span>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-500/10 border border-rose-500/20 text-rose-300 font-mono text-[11px] font-bold">
+                  <span className="text-zinc-500 font-normal">Loops:</span> {stats.loops}
                 </div>
               </div>
 
-              {/* Live Finger Status Tracker */}
-              <div className="mt-5 pt-4 border-t border-zinc-800/80">
-                <h4 className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider mb-2.5 flex items-center gap-1.5">
-                  <Activity className="w-3 h-3 text-indigo-400 animate-pulse" />
-                  Live Finger Status
-                </h4>
-                <div className="grid grid-cols-5 gap-1.5">
-                  {[
-                    { name: 'Thumb', label: 'Thumb', emoji: '👍', active: fingersState.thumb },
-                    { name: 'Index', label: 'Index', emoji: '☝️', active: fingersState.index },
-                    { name: 'Middle', label: 'Middle', emoji: '🖕', active: fingersState.middle },
-                    { name: 'Ring', label: 'Ring', emoji: '💍', active: fingersState.ring },
-                    { name: 'Pinky', label: 'Pinky', emoji: '🤙', active: fingersState.pinky },
-                  ].map(f => (
-                    <div 
-                      key={f.name}
-                      className={cn(
-                        "flex flex-col items-center justify-center p-1.5 rounded-lg border transition-all duration-300",
-                        f.active 
-                          ? "bg-indigo-500/10 border-indigo-500/30 text-indigo-400 shadow-[0_0_8px_rgba(99,102,241,0.15)] font-bold" 
-                          : "bg-zinc-950/80 border-zinc-800 text-zinc-600"
-                      )}
-                    >
-                      <span className={cn("text-xs mb-1 transition-transform duration-300", f.active && "scale-110 drop-shadow-[0_0_4px_rgba(255,255,255,0.2)]")}>
-                        {f.emoji}
-                      </span>
-                      <span className="text-[8px] font-mono uppercase tracking-tight truncate max-w-full">
-                        {f.name}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              {/* Master Stop All Button */}
+              <button
+                onClick={() => simulateGesture('Fist')}
+                className="flex items-center gap-1 px-2.5 py-1 bg-zinc-900 hover:bg-rose-950/50 text-zinc-300 hover:text-rose-300 border border-zinc-800 hover:border-rose-500/40 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-colors cursor-pointer"
+                title="Stop All Playing & Recording Tracks (✊ Fist)"
+                id="master-stop-btn"
+              >
+                <Square className="w-3 h-3 fill-current text-rose-400" />
+                <span>Stop All (✊)</span>
+              </button>
+            </div>
 
-              {/* Conductor Gesture Dictionary */}
-              <div className="mt-5 pt-4 border-t border-zinc-800/80">
-                <h4 className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider mb-2.5">
-                  Conductor Gesture Guide
-                </h4>
-                <div className="space-y-2 text-[10px] font-mono text-zinc-400">
-                  <div className={cn(
-                    "flex items-center justify-between p-1.5 px-2 rounded-lg border transition-all duration-200",
-                    (fingersState.index && fingersState.middle && fingersState.ring && fingersState.pinky)
-                      ? "bg-rose-500/10 border-rose-500/30 text-rose-300"
-                      : "bg-zinc-950/40 border-zinc-900"
-                  )}>
-                    <span className="font-bold flex items-center gap-1.5">🖐️ OPEN PALM</span>
-                    <span className="font-semibold text-rose-400">Record Loop (10s)</span>
+            {/* Live Finger Tracker */}
+            <div className="pb-3 border-b border-zinc-800/80">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-indigo-400" /> Finger Tracking
+                </span>
+                <span className="text-[9px] font-mono text-zinc-500">Live Status</span>
+              </div>
+              <div className="grid grid-cols-5 gap-1.5">
+                {[
+                  { name: 'Thumb', emoji: '👍', active: fingersState.thumb },
+                  { name: 'Index', emoji: '☝️', active: fingersState.index },
+                  { name: 'Middle', emoji: '🖕', active: fingersState.middle },
+                  { name: 'Ring', emoji: '💍', active: fingersState.ring },
+                  { name: 'Pinky', emoji: '🤙', active: fingersState.pinky },
+                ].map(f => (
+                  <div 
+                    key={f.name}
+                    className={cn(
+                      "flex items-center justify-center gap-1 py-1.5 px-1 rounded-lg border transition-all duration-200 text-center",
+                      f.active 
+                        ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-300 font-bold shadow-[0_0_8px_rgba(99,102,241,0.2)]" 
+                        : "bg-zinc-900/60 border-zinc-800/80 text-zinc-600"
+                    )}
+                  >
+                    <span className="text-[11px]">{f.emoji}</span>
+                    <span className="text-[8px] font-mono uppercase truncate">{f.name}</span>
                   </div>
-                  <div className={cn(
-                    "flex items-center justify-between p-1.5 px-2 rounded-lg border transition-all duration-200",
-                    (fingersState.index && !fingersState.middle && !fingersState.ring && !fingersState.pinky)
-                      ? "bg-indigo-500/10 border-indigo-500/30 text-indigo-300"
-                      : "bg-zinc-950/40 border-zinc-900"
-                  )}>
-                    <span className="font-bold flex items-center gap-1.5">☝️ POINT UP</span>
-                    <span className="font-semibold text-indigo-400">Pattern Synth</span>
-                  </div>
-                  <div className={cn(
-                    "flex items-center justify-between p-1.5 px-2 rounded-lg border transition-all duration-200",
-                    (!fingersState.index && !fingersState.middle && !fingersState.ring && !fingersState.pinky && lastFingersStateRef.current.index === false)
-                      ? "bg-zinc-800 border-zinc-700 text-white"
-                      : "bg-zinc-950/40 border-zinc-900"
-                  )}>
-                    <span className="font-bold flex items-center gap-1.5">✊ FIST</span>
-                    <span className="font-semibold text-zinc-500">Stop All Tracks</span>
-                  </div>
-                </div>
+                ))}
               </div>
             </div>
 
-            {/* Manual Controls / Simulator Shortcuts */}
-            <div className="pt-4 border-t border-zinc-800">
-              <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Simulate Input</h4>
-              <div className="grid grid-cols-2 gap-2">
-                <button 
-                  onClick={() => simulateGesture('Open Palm', 'record_loop', '1')}
-                  className="bg-zinc-950 hover:bg-rose-900/20 text-[9px] text-zinc-400 hover:text-rose-400 py-1.5 rounded-lg font-mono uppercase transition-colors border border-zinc-800 cursor-pointer"
-                >
-                  Sim_Palm
-                </button>
-                <button 
-                  onClick={() => simulateGesture('Point Up', 'play_instrument', '2')}
-                  className="bg-zinc-950 hover:bg-indigo-900/20 text-[9px] text-zinc-400 hover:text-indigo-400 py-1.5 rounded-lg font-mono uppercase transition-colors border border-zinc-800 cursor-pointer"
-                >
-                  Sim_Point
-                </button>
-                <button 
-                  onClick={() => simulateGesture('Fist', 'stop_all', '')}
-                  className="bg-zinc-950 hover:bg-zinc-800 text-[9px] text-zinc-400 py-1.5 rounded-lg font-mono uppercase transition-colors border border-zinc-800 col-span-2 cursor-pointer"
-                >
-                  Sim_Fist_Stop
-                </button>
+            {/* Conductor Gesture Guide */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">
+                  Conductor Gesture Map
+                </span>
+                <span className="text-[9px] font-mono text-zinc-500">Auto Triggered</span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 text-[9px] font-mono">
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.index && fingersState.middle && fingersState.ring && fingersState.pinky)
+                    ? "bg-rose-500/15 border-rose-500/40 text-rose-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">🖐️ PALM</span>
+                  <span className="text-rose-400 truncate max-w-[80px]">Mic Loop 1</span>
+                </div>
+
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.thumb && !fingersState.index && !fingersState.middle && !fingersState.ring && !fingersState.pinky)
+                    ? "bg-rose-500/15 border-rose-500/40 text-rose-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">👍 THUMB</span>
+                  <span className="text-rose-400 truncate max-w-[80px]">Mic Loop 2</span>
+                </div>
+
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.index && !fingersState.middle && !fingersState.ring && fingersState.pinky)
+                    ? "bg-rose-500/15 border-rose-500/40 text-rose-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">🤘 ROCK</span>
+                  <span className="text-rose-400 truncate max-w-[80px]">Mic Loop 3</span>
+                </div>
+
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.thumb && !fingersState.index && !fingersState.middle && !fingersState.ring && fingersState.pinky)
+                    ? "bg-rose-500/15 border-rose-500/40 text-rose-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">🤙 CALL ME</span>
+                  <span className="text-rose-400 truncate max-w-[80px]">Mic Loop 4</span>
+                </div>
+
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.index && !fingersState.middle && !fingersState.ring && !fingersState.pinky)
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-indigo-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">☝️ POINT</span>
+                  <span className="text-indigo-400 truncate max-w-[80px]">PolySynth</span>
+                </div>
+
+                <div className={cn(
+                  "flex items-center justify-between px-2.5 py-1.5 rounded-lg border transition-colors",
+                  (fingersState.index && fingersState.middle && !fingersState.ring && !fingersState.pinky)
+                    ? "bg-cyan-500/15 border-cyan-500/40 text-cyan-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400"
+                )}>
+                  <span className="font-bold">✌️ PEACE</span>
+                  <span className="text-cyan-400 truncate max-w-[80px]">808 Groove</span>
+                </div>
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Tracks Area (Bottom) */}
-      <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4 flex-1 overflow-hidden flex flex-col shadow-inner">
-        <div className="flex justify-between items-center mb-3">
-          <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400">Live Audio Routing</h2>
-          <button className="flex items-center gap-1 text-[10px] font-bold uppercase text-indigo-400 hover:text-indigo-300 transition-colors bg-indigo-500/10 px-2.5 py-1 rounded border border-indigo-500/20">
-            <Plus className="w-3 h-3" /> Assign New Track
-          </button>
+      {/* Full-Screen Expanded Live Audio Routing Studio (4 Columns, 3 Rows = 12 Tracks) */}
+      <div className="bg-zinc-950 border border-zinc-800 rounded-2xl p-4 flex flex-col shadow-xl flex-1">
+        {/* Studio Console Header */}
+        <div className="flex justify-between items-center mb-3 pb-2.5 border-b border-zinc-800/80">
+          <div className="flex items-center gap-2.5">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+              <Sliders className="w-4 h-4 text-indigo-400" />
+              Live Audio Routing
+            </h2>
+            <span className="text-[10px] font-mono bg-zinc-900 text-indigo-400 px-2.5 py-0.5 rounded-full border border-zinc-800 font-semibold">
+              {tracks.length} Active Tracks (3x4 Matrix • {tracks.filter(t => t.type === 'loop').length} Mic Loops)
+            </span>
+          </div>
+          
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => setIsAssignModalOpen(true)}
+              className="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-white bg-indigo-600 hover:bg-indigo-500 transition-all px-3 py-1.5 rounded-lg border border-indigo-500 shadow-md shadow-indigo-600/20 cursor-pointer active:scale-95"
+              id="assign-new-track-btn"
+            >
+              <Plus className="w-3.5 h-3.5" /> Assign New Track
+            </button>
+          </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto space-y-2 pr-2">
-          {tracks.map((track) => (
+        {/* 12-Track 4-Column Grid Layout (3 Rows x 4 Columns) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+          {tracks.map((track, idx) => (
             <div 
               key={track.id} 
               className={cn(
-                "group flex items-center gap-3 p-1 px-3 rounded-lg border transition-all duration-300",
-                track.status === 'recording' ? "bg-rose-600/10 border-rose-500/30" :
-                track.status === 'playing' ? "bg-indigo-600/10 border-indigo-500/30" :
-                "bg-zinc-900 border-zinc-800 opacity-75 hover:opacity-100"
+                "group flex flex-col justify-between p-2.5 rounded-xl border transition-all duration-200 relative",
+                track.status === 'recording' ? "bg-rose-950/25 border-rose-500/50 shadow-[0_0_12px_rgba(244,63,94,0.15)] ring-1 ring-rose-500/30" :
+                track.status === 'playing' ? "bg-indigo-950/25 border-indigo-500/50 shadow-[0_0_12px_rgba(99,102,241,0.15)] ring-1 ring-indigo-500/30" :
+                track.muted ? "bg-zinc-950/60 border-zinc-900 opacity-50" :
+                "bg-zinc-900/70 border-zinc-800/80 hover:border-zinc-700"
               )}
             >
-              {/* Status Icon */}
-              <div className={cn(
-                "w-8 h-8 rounded flex items-center justify-center shrink-0 transition-colors",
-                track.status === 'recording' ? "bg-rose-500 text-white" :
-                track.status === 'playing' ? "bg-zinc-800 text-indigo-400" :
-                "bg-zinc-800 text-zinc-500"
-              )}>
-                {track.type === 'loop' ? <Mic className="w-3.5 h-3.5" /> :
-                 track.type === 'instrument' ? <Radio className="w-3.5 h-3.5" /> :
-                 <Play className="w-3.5 h-3.5" />}
+              {/* Row 1: Track Identity & Gain Level / Mute */}
+              <div className="flex items-center justify-between gap-1.5">
+                <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                  {/* Status Indicator Icon */}
+                  <div className={cn(
+                    "w-6 h-6 rounded-lg flex items-center justify-center shrink-0 text-xs transition-colors",
+                    track.status === 'recording' ? "bg-rose-500 text-white animate-pulse" :
+                    track.status === 'playing' ? "bg-indigo-600 text-white" :
+                    track.type === 'loop' ? "bg-rose-500/10 text-rose-400 border border-rose-500/20" :
+                    track.type === 'instrument' ? "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20" :
+                    "bg-cyan-500/10 text-cyan-400 border border-cyan-500/20"
+                  )}>
+                    {track.type === 'loop' ? <Mic className="w-3 h-3" /> :
+                     track.type === 'instrument' ? <Music className="w-3 h-3" /> :
+                     <Radio className="w-3 h-3" />}
+                  </div>
+
+                  {/* Track Title */}
+                  <span className="text-[11px] font-bold uppercase tracking-tight truncate text-zinc-200" title={track.name}>
+                    <span className="font-mono text-zinc-500 text-[10px] mr-1">{idx < 9 ? `0${idx + 1}` : idx + 1}</span>
+                    {track.name}
+                  </span>
+                </div>
+
+                {/* Volume & Mute */}
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={() => handleToggleMute(track.id)}
+                    className={cn(
+                      "p-1 rounded text-zinc-500 hover:text-white transition-colors cursor-pointer",
+                      track.muted && "text-rose-400 hover:text-rose-300"
+                    )}
+                    title={track.muted ? "Unmute Track" : "Mute Track"}
+                  >
+                    {track.muted ? <VolumeX className="w-3 h-3" /> : <Volume2 className="w-3 h-3" />}
+                  </button>
+
+                  <input
+                    type="range"
+                    min="-30"
+                    max="6"
+                    step="1"
+                    value={track.volume ?? -6}
+                    onChange={(e) => handleVolumeChange(track.id, Number(e.target.value))}
+                    disabled={track.muted}
+                    className="w-10 h-1 bg-zinc-800 rounded appearance-none accent-indigo-500 cursor-pointer disabled:opacity-30"
+                  />
+                  <span className="font-mono text-[8px] text-zinc-500 w-6 text-right">
+                    {track.muted ? 'MUT' : `${track.volume ?? -6}dB`}
+                  </span>
+
+                  {tracks.length > 1 && (
+                    <button
+                      onClick={() => handleDeleteTrack(track.id)}
+                      className="p-1 text-zinc-600 hover:text-rose-400 rounded hover:bg-rose-500/10 transition-colors cursor-pointer"
+                      title="Remove Track"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
               </div>
 
-              {/* Track Info */}
-              <div className="flex-1 min-w-0">
-                <div className={cn("text-xs font-bold uppercase tracking-wide truncate", track.status === 'idle' ? "text-white" : track.status === 'recording' ? "text-white" : "text-indigo-200")}>
-                  Track 0{track.id}: {track.name}
-                </div>
-                <div className={cn("text-[9px] font-mono uppercase mt-0.5", track.status === 'idle' ? "text-zinc-500" : track.status === 'recording' ? "text-rose-400 font-bold" : "text-indigo-400")}>
-                  {track.status === 'recording' ? `Recording... ${recordingTimeLeft.toFixed(1)}s` : track.status === 'playing' ? `Playing: ${track.type}` : 'Muted'}
-                </div>
-                
-                {/* Visualizer / Progress Bar */}
-                <div className="h-1.5 w-full mt-1.5 flex items-center bg-zinc-800/40 rounded-full overflow-hidden relative">
-                  {track.status === 'recording' ? (
-                    <div 
-                      className="h-full bg-rose-500 transition-all duration-100" 
-                      style={{ width: `${((10 - recordingTimeLeft) / 10) * 100}%` }}
-                    />
-                  ) : track.status === 'playing' ? (
-                    <div className="flex items-center gap-0.5 w-full h-full">
-                      {Array.from({ length: 40 }).map((_, i) => (
+              {/* Sub-row: Badges (Loop duration & Assigned Gesture) */}
+              <div className="flex items-center gap-1.5 my-1.5">
+                <span className="shrink-0 text-[8px] font-mono uppercase bg-zinc-800/90 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-700/50">
+                  {track.type === 'loop' ? `${track.loopDuration || 10}s Loop` : track.type}
+                </span>
+
+                {track.assignedGesture && track.assignedGesture !== 'Manual Only' && (
+                  <span className="shrink-0 text-[8px] font-mono uppercase bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 px-1.5 py-0.5 rounded truncate max-w-[110px]">
+                    {track.assignedGesture}
+                  </span>
+                )}
+              </div>
+
+              {/* Row 2: Status Progress Bar & Quick Action Triggers */}
+              <div className="flex items-center justify-between gap-1.5 pt-1.5 border-t border-zinc-800/50">
+                {/* Visualizer / Progress */}
+                <div className="flex-1 flex items-center gap-1.5 min-w-0">
+                  <span className={cn(
+                    "text-[9px] font-mono uppercase tracking-tight shrink-0 font-bold truncate max-w-[55px]",
+                    track.status === 'recording' ? "text-rose-400" :
+                    track.status === 'playing' ? "text-indigo-400" :
+                    "text-zinc-500"
+                  )}>
+                    {track.status === 'recording' 
+                      ? `${recordingTimeLeft.toFixed(1)}s` 
+                      : track.status === 'playing' 
+                      ? (track.type === 'loop' 
+                          ? `${(loopProgress[track.id]?.secondsLeft ?? (track.loopDuration || 10)).toFixed(1)}s` 
+                          : `Play`) 
+                      : track.muted 
+                      ? 'Mut' 
+                      : 'Rdy'}
+                  </span>
+
+                  <div className="h-1.5 flex-1 bg-zinc-800/80 rounded-full overflow-hidden relative">
+                    {track.status === 'recording' ? (
+                      <div 
+                        className="h-full bg-rose-500 transition-all duration-100 shadow-[0_0_6px_rgba(244,63,94,0.6)]" 
+                        style={{ width: `${(((track.loopDuration || 10) - recordingTimeLeft) / (track.loopDuration || 10)) * 100}%` }}
+                      />
+                    ) : track.status === 'playing' ? (
+                      track.type === 'loop' ? (
                         <div 
-                          key={i} 
-                          className={cn(
-                            "h-full w-1 rounded-full transition-all duration-100",
-                            "bg-indigo-500"
-                          )}
-                          style={{
-                            opacity: Math.random() * 0.5 + 0.3,
-                            animationDelay: `${i * 0.05}s`
-                          }}
-                        />
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="h-full w-full bg-zinc-900/50" />
-                  )}
+                          className="h-full bg-indigo-500 transition-all duration-75 relative rounded-full shadow-[0_0_8px_rgba(99,102,241,0.6)]" 
+                          style={{ width: `${loopProgress[track.id]?.percent ?? 0}%` }}
+                        >
+                          <div className="absolute right-0 top-0 bottom-0 w-1 bg-white rounded-full shadow-[0_0_4px_#ffffff]" />
+                        </div>
+                      ) : (
+                        <div className="h-full w-full bg-gradient-to-r from-indigo-500 to-cyan-400 animate-pulse" />
+                      )
+                    ) : (
+                      <div className="h-full w-full bg-zinc-800/30" />
+                    )}
+                  </div>
                 </div>
-              </div>
 
-              {/* Track Controls */}
-              <div className="flex items-center gap-2 shrink-0">
-                <div className="text-right font-mono text-[10px] text-zinc-400">
-                  {track.volume === 0 ? '-inf' : `${track.volume}db`}
-                </div>
-                <button 
-                  className={cn(
-                    "w-6 h-6 rounded flex items-center justify-center transition-colors cursor-pointer",
-                    track.status === 'recording' ? "bg-rose-900/50 text-rose-400 hover:bg-rose-500 hover:text-white" :
-                    track.status === 'playing' ? "bg-indigo-900/50 text-indigo-400 hover:bg-indigo-500 hover:text-white" :
-                    "bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-white"
+                {/* Compact Action Buttons */}
+                <div className="flex items-center gap-1 shrink-0">
+                  {track.type === 'loop' ? (
+                    <>
+                      <button
+                        onClick={() => {
+                          if (track.status === 'recording' || activeRecordingTrackId === track.id) {
+                            finishRecording(track.id);
+                          } else {
+                            simulateGesture('Manual Rec', 'record_loop', track.id);
+                          }
+                        }}
+                        className={cn(
+                          "px-1.5 py-0.5 rounded text-[9px] font-bold font-mono uppercase flex items-center gap-0.5 transition-all cursor-pointer",
+                          (track.status === 'recording' || activeRecordingTrackId === track.id)
+                            ? "bg-rose-600 text-white animate-pulse shadow-[0_0_8px_rgba(244,63,94,0.6)] ring-1 ring-rose-400"
+                            : "bg-zinc-800 text-rose-400 hover:bg-rose-600/20 border border-rose-500/20"
+                        )}
+                        title={(track.status === 'recording' || activeRecordingTrackId === track.id) ? "Finish recording & start loop" : "Record Mic Loop"}
+                      >
+                        <Mic className="w-2.5 h-2.5" />
+                        <span>{(track.status === 'recording' || activeRecordingTrackId === track.id) ? 'End' : 'Rec'}</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          if (track.status === 'recording' || activeRecordingTrackId === track.id) {
+                            finishRecording(track.id);
+                          } else if (track.status === 'playing') {
+                            simulateGesture('Manual Stop', 'stop_single', track.id);
+                          } else {
+                            simulateGesture('Manual Play', 'play_loop', track.id);
+                          }
+                        }}
+                        className={cn(
+                          "px-1.5 py-0.5 rounded text-[9px] font-bold font-mono uppercase flex items-center gap-0.5 transition-colors cursor-pointer",
+                          track.status === 'playing'
+                            ? "bg-indigo-600 text-white shadow-[0_0_8px_rgba(99,102,241,0.4)]"
+                            : "bg-zinc-800 text-indigo-400 hover:bg-indigo-600/20 border border-indigo-500/20"
+                        )}
+                        title={track.status === 'playing' ? "Stop Loop" : "Play Loop"}
+                      >
+                        <Play className="w-2.5 h-2.5 fill-current" />
+                        <span>{track.status === 'playing' ? 'Loop' : 'Play'}</span>
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        simulateGesture('Manual Play', 'play', track.id);
+                      }}
+                      className={cn(
+                        "px-2 py-0.5 rounded text-[9px] font-bold font-mono uppercase flex items-center gap-0.5 transition-colors cursor-pointer",
+                        track.status === 'playing'
+                          ? "bg-indigo-600 text-white"
+                          : "bg-zinc-800 text-indigo-400 hover:bg-indigo-600/20 border border-indigo-500/20"
+                      )}
+                      title="Trigger Track"
+                    >
+                      <Play className="w-2.5 h-2.5 fill-current" />
+                      <span>Trigger</span>
+                    </button>
                   )}
-                  onClick={() => {
-                    if (track.status !== 'idle') {
-                      simulateGesture('Manual Stop', 'stop_all', track.id);
-                    }
-                  }}
-                >
-                  <Square className="w-2 h-2 fill-current" />
-                </button>
+
+                  {/* Stop Track Button */}
+                  <button 
+                    className={cn(
+                      "w-5 h-5 rounded flex items-center justify-center transition-colors cursor-pointer",
+                      track.status !== 'idle'
+                        ? "bg-zinc-800 text-rose-400 hover:bg-rose-900/50 hover:text-white"
+                        : "bg-zinc-900 text-zinc-600 hover:text-zinc-400"
+                    )}
+                    onClick={() => {
+                      simulateGesture('Manual Stop', 'stop_single', track.id);
+                    }}
+                    title="Stop track"
+                  >
+                    <Square className="w-2.5 h-2.5 fill-current" />
+                  </button>
+                </div>
               </div>
             </div>
           ))}

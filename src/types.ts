@@ -22,4 +22,9 @@ export interface TrackData {
   type: 'loop' | 'instrument' | 'sample';
   status: 'idle' | 'playing' | 'recording';
   volume: number;
+  preset?: string;
+  assignedGesture?: string;
+  notes?: string[];
+  muted?: boolean;
+  loopDuration?: number;
 }
